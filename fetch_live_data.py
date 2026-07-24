@@ -1,100 +1,124 @@
 """
-Templates for pulling live data. Fill in your API keys and run this on
-your own machine — this sandbox can't reach these external APIs directly.
+Walk-forward backtest: refits the model periodically using only data
+available up to that point in time, predicts each upcoming match BEFORE
+seeing its result, then logs predicted probabilities against what actually
+happened. This is the honest way to check whether the model has any real
+skill - never evaluate on matches the model was fitted on.
 
-Recommended providers:
-- Odds:    The Odds API (https://the-odds-api.com) - simple REST, free tier available
-- Stats:   API-Football (https://www.api-football.com) - fixtures, results, injuries, xG-adjacent stats
+Produces a ledger (like the public accuracy trackers on sites such as
+MyGameOdds) plus summary metrics: Brier score, log loss, and accuracy.
 """
-import os
-import requests
+from __future__ import annotations
+import numpy as np
 import pandas as pd
-
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "YOUR_ODDS_API_KEY")
-FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "YOUR_API_FOOTBALL_KEY")
+from dixon_coles import DixonColes
 
 
-def fetch_live_odds(sport_key: str = "soccer_epl", regions: str = "uk", markets: str = "h2h") -> pd.DataFrame:
+def _actual_outcome(home_goals: int, away_goals: int) -> str:
+    if home_goals > away_goals:
+        return "home_win"
+    elif home_goals < away_goals:
+        return "away_win"
+    return "draw"
+
+
+def brier_score(predicted_probs: dict[str, float], actual: str) -> float:
+    """Multi-class Brier score: mean squared error between predicted probs
+    and the one-hot actual outcome. 0 = perfect, ~0.67 = random guessing
+    on 3 outcomes, 2.0 = worst possible."""
+    outcomes = ["home_win", "draw", "away_win"]
+    return sum((predicted_probs[o] - (1.0 if o == actual else 0.0)) ** 2 for o in outcomes)
+
+
+def log_loss(predicted_probs: dict[str, float], actual: str, eps: float = 1e-10) -> float:
+    p = max(min(predicted_probs[actual], 1 - eps), eps)
+    return -np.log(p)
+
+
+def rolling_backtest(
+    matches: pd.DataFrame,
+    min_train_matches: int = 60,
+    refit_every: int = 10,
+    date_col: str = "date",
+) -> pd.DataFrame:
     """
-    Pulls current odds for upcoming matches. sport_key examples:
-    'soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga'.
-    See https://the-odds-api.com/sports-odds-data/sports-apis.html for the full list.
+    matches: full history, sorted or not (will be sorted by date here).
+    min_train_matches: how much history before the model starts making
+        predictions (early matches are just used to bootstrap fitting).
+    refit_every: how many matches to predict before refitting the model
+        on the newly available data (refitting every single match is
+        accurate but slow; refitting periodically is the practical
+        approach real prediction services use too).
+
+    Returns a DataFrame log: one row per predicted match with model
+    probabilities, the actual result, and per-match Brier/log-loss scores.
     """
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": regions, "markets": markets, "oddsFormat": "decimal"}
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    events = resp.json()
+    df = matches.sort_values(date_col).reset_index(drop=True)
+    log_rows = []
+    model = None
+    matches_since_fit = refit_every  # force a fit on the first eligible match
 
-    rows = []
-    for event in events:
-        home, away = event["home_team"], event["away_team"]
-        for bookmaker in event.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                if market["key"] != "h2h":
-                    continue
-                odds = {o["name"]: o["price"] for o in market["outcomes"]}
-                rows.append({
-                    "commence_time": event["commence_time"],
-                    "home_team": home,
-                    "away_team": away,
-                    "bookmaker": bookmaker["title"],
-                    "home_odds": odds.get(home),
-                    "draw_odds": odds.get("Draw"),
-                    "away_odds": odds.get(away),
-                })
-    return pd.DataFrame(rows)
+    for i in range(min_train_matches, len(df)):
+        train = df.iloc[:i]
+        test_row = df.iloc[i]
 
+        if model is None or matches_since_fit >= refit_every:
+            model = DixonColes().fit(train, date_col=date_col)
+            matches_since_fit = 0
+        matches_since_fit += 1
 
-def fetch_recent_results(league_id: int, season: int, last_n: int = 100) -> pd.DataFrame:
-    """
-    Pulls recent match results for model fitting. league_id examples (API-Football):
-    39 = Premier League, 140 = La Liga, 78 = Bundesliga, 135 = Serie A.
-    """
-    url = "https://v3.football.api-sports.io/fixtures"
-    headers = {"x-apisports-key": FOOTBALL_API_KEY}
-    params = {"league": league_id, "season": season, "status": "FT", "last": last_n}
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    fixtures = resp.json().get("response", [])
+        home, away = test_row["home_team"], test_row["away_team"]
+        if home not in model.attack or away not in model.attack:
+            continue  # new team with no history yet - skip
 
-    rows = []
-    for fx in fixtures:
-        rows.append({
-            "date": fx["fixture"]["date"][:10],
-            "home_team": fx["teams"]["home"]["name"],
-            "away_team": fx["teams"]["away"]["name"],
-            "home_goals": fx["goals"]["home"],
-            "away_goals": fx["goals"]["away"],
+        pred = model.predict_outcome_probs(home, away)
+        actual = _actual_outcome(test_row["home_goals"], test_row["away_goals"])
+
+        log_rows.append({
+            "date": test_row[date_col],
+            "home_team": home,
+            "away_team": away,
+            "home_goals": test_row["home_goals"],
+            "away_goals": test_row["away_goals"],
+            "pred_home_win": pred["home_win"],
+            "pred_draw": pred["draw"],
+            "pred_away_win": pred["away_win"],
+            "predicted_favorite": max(pred, key=pred.get),
+            "actual": actual,
+            "correct_favorite": max(pred, key=pred.get) == actual,
+            "brier_score": brier_score(pred, actual),
+            "log_loss": log_loss(pred, actual),
         })
-    return pd.DataFrame(rows)
+
+    return pd.DataFrame(log_rows)
 
 
-def fetch_upcoming_fixtures(league_id: int, season: int, next_n: int = 20) -> pd.DataFrame:
-    """
-    Pulls the next N scheduled (not yet played) fixtures for a league.
-    Same league_id codes as fetch_recent_results.
-    """
-    url = "https://v3.football.api-sports.io/fixtures"
-    headers = {"x-apisports-key": FOOTBALL_API_KEY}
-    params = {"league": league_id, "season": season, "status": "NS", "next": next_n}
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    fixtures = resp.json().get("response", [])
+def summarize_backtest(log: pd.DataFrame) -> dict:
+    """Headline metrics + a naive baseline (always predict home win, since
+    home advantage alone beats random guessing) so you have something to
+    judge the model against."""
+    if log.empty:
+        return {"error": "No predictions logged - check min_train_matches vs data size."}
 
-    rows = []
-    for fx in fixtures:
-        rows.append({
-            "date": fx["fixture"]["date"][:10],
-            "kickoff": fx["fixture"]["date"],
-            "home_team": fx["teams"]["home"]["name"],
-            "away_team": fx["teams"]["away"]["name"],
-        })
-    return pd.DataFrame(rows)
+    n = len(log)
+    naive_baseline = (log["actual"] == "home_win").mean()  # accuracy of "always pick home"
+
+    return {
+        "matches_evaluated": n,
+        "accuracy": float(log["correct_favorite"].mean()),
+        "naive_always_home_accuracy": float(naive_baseline),
+        "mean_brier_score": float(log["brier_score"].mean()),
+        "mean_log_loss": float(log["log_loss"].mean()),
+        "outcome_distribution": log["actual"].value_counts(normalize=True).to_dict(),
+    }
 
 
 if __name__ == "__main__":
-    print("Set ODDS_API_KEY and FOOTBALL_API_KEY as environment variables, then:")
-    print("  odds = fetch_live_odds('soccer_epl')")
-    print("  results = fetch_recent_results(league_id=39, season=2025)")
-    print("  fixtures = fetch_upcoming_fixtures(league_id=39, season=2025)")
+    matches = pd.read_csv("data/sample_matches.csv")
+    log = rolling_backtest(matches, min_train_matches=60, refit_every=10)
+    log.to_csv("data/backtest_log.csv", index=False)
+
+    summary = summarize_backtest(log)
+    print("=== Backtest summary ===")
+    for k, v in summary.items():
+        print(f"{k}: {v}")

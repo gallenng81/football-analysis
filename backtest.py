@@ -1,124 +1,141 @@
-"""
-Walk-forward backtest: refits the model periodically using only data
-available up to that point in time, predicts each upcoming match BEFORE
-seeing its result, then logs predicted probabilities against what actually
-happened. This is the honest way to check whether the model has any real
-skill - never evaluate on matches the model was fitted on.
-
-Produces a ledger (like the public accuracy trackers on sites such as
-MyGameOdds) plus summary metrics: Brier score, log loss, and accuracy.
-"""
-from __future__ import annotations
-import numpy as np
-import pandas as pd
-from dixon_coles import DixonColes
-
-
-def _actual_outcome(home_goals: int, away_goals: int) -> str:
-    if home_goals > away_goals:
-        return "home_win"
-    elif home_goals < away_goals:
-        return "away_win"
-    return "draw"
-
-
-def brier_score(predicted_probs: dict[str, float], actual: str) -> float:
-    """Multi-class Brier score: mean squared error between predicted probs
-    and the one-hot actual outcome. 0 = perfect, ~0.67 = random guessing
-    on 3 outcomes, 2.0 = worst possible."""
-    outcomes = ["home_win", "draw", "away_win"]
-    return sum((predicted_probs[o] - (1.0 if o == actual else 0.0)) ** 2 for o in outcomes)
-
-
-def log_loss(predicted_probs: dict[str, float], actual: str, eps: float = 1e-10) -> float:
-    p = max(min(predicted_probs[actual], 1 - eps), eps)
-    return -np.log(p)
-
-
-def rolling_backtest(
-    matches: pd.DataFrame,
-    min_train_matches: int = 60,
-    refit_every: int = 10,
-    date_col: str = "date",
-) -> pd.DataFrame:
-    """
-    matches: full history, sorted or not (will be sorted by date here).
-    min_train_matches: how much history before the model starts making
-        predictions (early matches are just used to bootstrap fitting).
-    refit_every: how many matches to predict before refitting the model
-        on the newly available data (refitting every single match is
-        accurate but slow; refitting periodically is the practical
-        approach real prediction services use too).
-
-    Returns a DataFrame log: one row per predicted match with model
-    probabilities, the actual result, and per-match Brier/log-loss scores.
-    """
-    df = matches.sort_values(date_col).reset_index(drop=True)
-    log_rows = []
-    model = None
-    matches_since_fit = refit_every  # force a fit on the first eligible match
-
-    for i in range(min_train_matches, len(df)):
-        train = df.iloc[:i]
-        test_row = df.iloc[i]
-
-        if model is None or matches_since_fit >= refit_every:
-            model = DixonColes().fit(train, date_col=date_col)
-            matches_since_fit = 0
-        matches_since_fit += 1
-
-        home, away = test_row["home_team"], test_row["away_team"]
-        if home not in model.attack or away not in model.attack:
-            continue  # new team with no history yet - skip
-
-        pred = model.predict_outcome_probs(home, away)
-        actual = _actual_outcome(test_row["home_goals"], test_row["away_goals"])
-
-        log_rows.append({
-            "date": test_row[date_col],
-            "home_team": home,
-            "away_team": away,
-            "home_goals": test_row["home_goals"],
-            "away_goals": test_row["away_goals"],
-            "pred_home_win": pred["home_win"],
-            "pred_draw": pred["draw"],
-            "pred_away_win": pred["away_win"],
-            "predicted_favorite": max(pred, key=pred.get),
-            "actual": actual,
-            "correct_favorite": max(pred, key=pred.get) == actual,
-            "brier_score": brier_score(pred, actual),
-            "log_loss": log_loss(pred, actual),
-        })
-
-    return pd.DataFrame(log_rows)
-
-
-def summarize_backtest(log: pd.DataFrame) -> dict:
-    """Headline metrics + a naive baseline (always predict home win, since
-    home advantage alone beats random guessing) so you have something to
-    judge the model against."""
-    if log.empty:
-        return {"error": "No predictions logged - check min_train_matches vs data size."}
-
-    n = len(log)
-    naive_baseline = (log["actual"] == "home_win").mean()  # accuracy of "always pick home"
-
-    return {
-        "matches_evaluated": n,
-        "accuracy": float(log["correct_favorite"].mean()),
-        "naive_always_home_accuracy": float(naive_baseline),
-        "mean_brier_score": float(log["brier_score"].mean()),
-        "mean_log_loss": float(log["log_loss"].mean()),
-        "outcome_distribution": log["actual"].value_counts(normalize=True).to_dict(),
-    }
-
-
-if __name__ == "__main__":
-    matches = pd.read_csv("data/sample_matches.csv")
-    log = rolling_backtest(matches, min_train_matches=60, refit_every=10)
-    log.to_csv("data/backtest_log.csv", index=False)
-
-    summary = summarize_backtest(log)
-    print("=== Backtest summary ===")
-    for k, v in summary.items():
-        print(f"{k}: {v}")
+date,home_team,away_team,home_goals,away_goals
+2025-02-02,Man City,Brighton,1,2
+2025-02-02,Aston Villa,Tottenham,0,0
+2025-02-02,Man United,West Ham,3,1
+2025-02-02,Arsenal,Chelsea,3,1
+2025-02-02,Newcastle,Liverpool,4,2
+2025-03-03,Liverpool,Arsenal,2,1
+2025-03-03,Tottenham,Chelsea,3,4
+2025-03-03,Newcastle,Man City,1,2
+2025-03-03,Brighton,West Ham,0,1
+2025-03-03,Man United,Aston Villa,3,1
+2025-04-04,Aston Villa,Chelsea,2,3
+2025-04-04,Brighton,West Ham,1,1
+2025-04-04,Liverpool,Tottenham,5,0
+2025-04-04,Newcastle,Man City,2,2
+2025-04-04,Man United,Arsenal,2,1
+2025-05-05,Chelsea,Aston Villa,1,4
+2025-05-05,Man United,Man City,3,1
+2025-05-05,Arsenal,West Ham,0,2
+2025-05-05,Tottenham,Newcastle,2,0
+2025-05-05,Liverpool,Brighton,3,1
+2025-06-06,West Ham,Newcastle,1,0
+2025-06-06,Arsenal,Brighton,2,1
+2025-06-06,Liverpool,Man City,1,1
+2025-06-06,Chelsea,Man United,3,4
+2025-06-06,Aston Villa,Tottenham,2,0
+2025-07-07,Brighton,Man City,6,2
+2025-07-07,Chelsea,Newcastle,4,3
+2025-07-07,Tottenham,Arsenal,1,2
+2025-07-07,Liverpool,Aston Villa,2,1
+2025-07-07,West Ham,Man United,5,3
+2025-08-08,Aston Villa,Tottenham,4,2
+2025-08-08,Man City,Man United,1,0
+2025-08-08,Brighton,Newcastle,1,2
+2025-08-08,Arsenal,West Ham,1,1
+2025-08-08,Chelsea,Liverpool,1,2
+2025-09-09,Chelsea,Arsenal,2,0
+2025-09-09,West Ham,Liverpool,1,0
+2025-09-09,Man City,Man United,1,1
+2025-09-09,Newcastle,Aston Villa,3,1
+2025-09-09,Tottenham,Brighton,3,1
+2025-10-10,Man City,Liverpool,0,0
+2025-10-10,Brighton,Newcastle,3,4
+2025-10-10,Tottenham,Chelsea,1,0
+2025-10-10,West Ham,Aston Villa,4,1
+2025-10-10,Arsenal,Man United,5,2
+2025-11-11,Chelsea,Brighton,0,3
+2025-11-11,Newcastle,Man City,2,1
+2025-11-11,Aston Villa,Arsenal,2,1
+2025-11-11,Tottenham,Man United,3,0
+2025-11-11,Liverpool,West Ham,1,3
+2025-12-12,Man City,Brighton,3,0
+2025-12-12,Tottenham,Chelsea,0,0
+2025-12-12,Aston Villa,Newcastle,1,2
+2025-12-12,Liverpool,Man United,2,3
+2025-12-12,West Ham,Arsenal,2,4
+2025-01-13,Man City,Brighton,2,1
+2025-01-13,Liverpool,Arsenal,2,0
+2025-01-13,Chelsea,Man United,7,0
+2025-01-13,Tottenham,West Ham,2,2
+2025-01-13,Aston Villa,Newcastle,3,4
+2025-02-14,Liverpool,Brighton,2,0
+2025-02-14,Man City,Chelsea,7,0
+2025-02-14,Aston Villa,Newcastle,4,1
+2025-02-14,Tottenham,Man United,1,0
+2025-02-14,Arsenal,West Ham,2,3
+2025-03-15,Liverpool,Newcastle,2,3
+2025-03-15,Brighton,Chelsea,1,1
+2025-03-15,Man City,West Ham,6,1
+2025-03-15,Man United,Tottenham,1,2
+2025-03-15,Arsenal,Aston Villa,1,1
+2025-04-16,Man City,Liverpool,5,2
+2025-04-16,Aston Villa,Tottenham,0,1
+2025-04-16,Newcastle,Chelsea,6,2
+2025-04-16,Man United,West Ham,0,8
+2025-04-16,Brighton,Arsenal,1,2
+2025-05-17,West Ham,Liverpool,4,2
+2025-05-17,Tottenham,Man United,0,3
+2025-05-17,Newcastle,Chelsea,1,2
+2025-05-17,Man City,Brighton,3,2
+2025-05-17,Aston Villa,Arsenal,4,0
+2025-06-18,Liverpool,Chelsea,4,2
+2025-06-18,Newcastle,Arsenal,5,2
+2025-06-18,West Ham,Brighton,1,2
+2025-06-18,Tottenham,Man City,1,1
+2025-06-18,Man United,Aston Villa,0,3
+2025-07-19,Man City,Newcastle,2,2
+2025-07-19,Tottenham,Brighton,0,0
+2025-07-19,Man United,Liverpool,3,0
+2025-07-19,Aston Villa,West Ham,2,1
+2025-07-19,Chelsea,Arsenal,0,1
+2025-08-20,Liverpool,Newcastle,4,2
+2025-08-20,Man City,Tottenham,3,1
+2025-08-20,Aston Villa,Chelsea,1,1
+2025-08-20,Man United,Arsenal,2,1
+2025-08-20,Brighton,West Ham,1,0
+2025-09-21,Arsenal,West Ham,0,4
+2025-09-21,Liverpool,Brighton,3,2
+2025-09-21,Man City,Tottenham,4,2
+2025-09-21,Newcastle,Aston Villa,2,2
+2025-09-21,Chelsea,Man United,2,0
+2025-10-22,Chelsea,West Ham,4,0
+2025-10-22,Man City,Man United,3,1
+2025-10-22,Arsenal,Liverpool,1,3
+2025-10-22,Newcastle,Tottenham,4,1
+2025-10-22,Aston Villa,Brighton,3,1
+2025-11-23,Arsenal,Man City,1,3
+2025-11-23,Chelsea,Man United,5,3
+2025-11-23,Tottenham,Brighton,2,2
+2025-11-23,Newcastle,Liverpool,3,3
+2025-11-23,West Ham,Aston Villa,3,1
+2025-12-24,Man United,Newcastle,0,2
+2025-12-24,Chelsea,Liverpool,3,0
+2025-12-24,Brighton,Arsenal,0,2
+2025-12-24,Man City,Tottenham,1,0
+2025-12-24,Aston Villa,West Ham,3,1
+2025-01-25,Newcastle,Liverpool,3,2
+2025-01-25,Tottenham,Aston Villa,1,0
+2025-01-25,West Ham,Arsenal,1,3
+2025-01-25,Chelsea,Man City,1,1
+2025-01-25,Brighton,Man United,2,0
+2025-02-26,West Ham,Man City,1,0
+2025-02-26,Chelsea,Tottenham,2,3
+2025-02-26,Liverpool,Man United,2,0
+2025-02-26,Brighton,Newcastle,3,2
+2025-02-26,Arsenal,Aston Villa,0,2
+2025-03-27,Tottenham,Arsenal,1,1
+2025-03-27,Man City,Chelsea,1,4
+2025-03-27,Man United,Brighton,1,1
+2025-03-27,West Ham,Aston Villa,0,1
+2025-03-27,Liverpool,Newcastle,2,3
+2025-04-01,Brighton,West Ham,3,2
+2025-04-01,Man United,Arsenal,3,4
+2025-04-01,Tottenham,Chelsea,2,0
+2025-04-01,Aston Villa,Newcastle,6,0
+2025-04-01,Liverpool,Man City,3,0
+2025-05-02,Newcastle,Aston Villa,4,2
+2025-05-02,West Ham,Arsenal,0,1
+2025-05-02,Man United,Chelsea,6,2
+2025-05-02,Man City,Liverpool,1,0
+2025-05-02,Tottenham,Brighton,3,2

@@ -1,191 +1,149 @@
 """
-Turns raw model probabilities + bookmaker odds into a plain-language
-analysis a user can actually read and act on - not just numbers, but an
-explanation of what the odds say, where the model disagrees, and how
-confident that disagreement is.
+Alternative to fetch_live_data.py that needs NO API key and NO signup:
+football-data.co.uk publishes free CSV downloads of historical results,
+match odds, and upcoming fixtures with pre-match odds, updated twice
+weekly (results) and Friday/Tuesday afternoons (fixtures).
+
+Trade-off vs the API-Football/Odds-API route: this only covers ~30
+countries' top divisions (not 1200+ leagues), and "upcoming odds" means
+a snapshot collected once before each round rather than truly live odds
+that update by the minute. For most personal-use score prediction this
+is a perfectly good trade for not needing any account at all.
+
+League codes (used in both functions below):
+    E0 = England Premier League      E1 = England Championship
+    SP1 = Spain La Liga               SP2 = Spain Segunda
+    D1 = Germany Bundesliga           D2 = Germany Bundesliga 2
+    I1 = Italy Serie A                I2 = Italy Serie B
+    F1 = France Ligue 1               F2 = France Ligue 2
+    N1 = Netherlands Eredivisie       B1 = Belgium First Division
+    P1 = Portugal Primeira Liga       T1 = Turkey Super Lig
+    G1 = Greece Super League
+Full list and column meanings: https://www.football-data.co.uk/notes.txt
 """
 from __future__ import annotations
-import os
-from datetime import datetime, timezone
-
+import requests
 import pandas as pd
+from io import StringIO
 
-from odds_comparison import implied_probability, devig_market_probabilities
+BASE_URL = "https://www.football-data.co.uk"
 
-
-def market_overround(bookmaker_odds: dict[str, float]) -> float:
-    """The bookmaker's built-in margin, e.g. 0.06 means the odds imply
-    106% total probability - that extra 6% is the house edge."""
-    raw_implied = sum(implied_probability(o) for o in bookmaker_odds.values())
-    return raw_implied - 1.0
-
-
-def compare_model_market(model_probs: dict[str, float], bookmaker_odds: dict[str, float]) -> pd.DataFrame:
-    """Side-by-side table: model probability, market's fair (de-vigged)
-    probability, the odds themselves, and the gap between model and market."""
-    raw_implied = {k: implied_probability(v) for k, v in bookmaker_odds.items()}
-    fair_implied = devig_market_probabilities(raw_implied)
-
-    rows = []
-    for outcome in model_probs:
-        model_p = model_probs[outcome]
-        fair_p = fair_implied[outcome]
-        rows.append({
-            "outcome": outcome,
-            "model_probability": round(model_p, 4),
-            "market_fair_probability": round(fair_p, 4),
-            "bookmaker_odds": bookmaker_odds[outcome],
-            "gap": round(model_p - fair_p, 4),
-        })
-    return pd.DataFrame(rows).sort_values("gap", ascending=False).reset_index(drop=True)
+# Priority order for odds columns - not every season/league has every
+# bookmaker, so fall back down this list until one is found.
+ODDS_COLUMN_SETS = [
+    ("PSH", "PSD", "PSA"),      # Pinnacle - sharpest line, when available
+    ("B365H", "B365D", "B365A"),  # Bet365 - most consistently available
+    ("AvgH", "AvgD", "AvgA"),    # market average across bookmakers
+    ("WHH", "WHD", "WHA"),      # William Hill
+]
 
 
-def confidence_label(gap: float) -> str:
-    """Translates a raw probability gap into a plain-English confidence read."""
-    abs_gap = abs(gap)
-    if abs_gap < 0.02:
-        return "negligible - model and market essentially agree"
-    elif abs_gap < 0.05:
-        return "slight disagreement - within normal model noise"
-    elif abs_gap < 0.10:
-        return "moderate disagreement - worth a second look"
-    else:
-        return "large disagreement - unusual, double-check team news/injuries before trusting this"
+def _parse_dates(date_series: pd.Series) -> pd.Series:
+    """football-data.co.uk uses dd/mm/yy in recent seasons and dd/mm/yyyy
+    in some older ones - try both explicitly rather than let pandas guess
+    per-row (slow and warns)."""
+    parsed = pd.to_datetime(date_series, format="%d/%m/%y", errors="coerce")
+    still_missing = parsed.isna()
+    if still_missing.any():
+        parsed_alt = pd.to_datetime(date_series[still_missing], format="%d/%m/%Y", errors="coerce")
+        parsed.loc[still_missing] = parsed_alt
+    return parsed.dt.strftime("%Y-%m-%d")
 
 
-def generate_match_report(home_team: str, away_team: str,
-                           model_probs: dict[str, float],
-                           bookmaker_odds: dict[str, float],
-                           top_scorelines: list[tuple[str, float]] | None = None,
-                           extra_markets: dict | None = None) -> str:
-    """Produces a readable text report for one match, combining the
-    model's view, the market's view, and where/how much they disagree."""
-    comparison = compare_model_market(model_probs, bookmaker_odds)
-    overround = market_overround(bookmaker_odds)
-
-    model_favorite = max(model_probs, key=model_probs.get)
-    market_fair = devig_market_probabilities({k: implied_probability(v) for k, v in bookmaker_odds.items()})
-    market_favorite = max(market_fair, key=market_fair.get)
-
-    label = {"home_win": home_team, "draw": "a draw", "away_win": away_team}
-
-    lines = []
-    lines.append(f"{home_team} vs {away_team}")
-    lines.append("=" * len(f"{home_team} vs {away_team}"))
-    lines.append("")
-    lines.append(f"Model's favorite: {label[model_favorite]} ({model_probs[model_favorite]:.1%})")
-    lines.append(f"Market's favorite: {label[market_favorite]} ({market_fair[market_favorite]:.1%}, after removing the bookmaker's margin)")
-    lines.append(f"Bookmaker margin on this match: {overround:.1%} (the house edge built into these odds)")
-    lines.append("")
-
-    if model_favorite == market_favorite:
-        lines.append("Model and market agree on the favorite. Any edge here is about magnitude, not direction.")
-    else:
-        lines.append(f"Model and market DISAGREE on the favorite - the model favors "
-                      f"{label[model_favorite]} while the market favors {label[market_favorite]}. "
-                      f"This is the more interesting (and riskier) kind of signal.")
-    lines.append("")
-
-    lines.append("Outcome-by-outcome breakdown:")
-    for _, row in comparison.iterrows():
-        outcome_label = label[row["outcome"]]
-        lines.append(
-            f"  {outcome_label}: model {row['model_probability']:.1%} vs market {row['market_fair_probability']:.1%} "
-            f"(gap {row['gap']:+.1%}, odds {row['bookmaker_odds']}) - {confidence_label(row['gap'])}"
-        )
-    lines.append("")
-
-    if top_scorelines:
-        lines.append("Most likely scorelines (model):")
-        for score, prob in top_scorelines:
-            lines.append(f"  {score}: {prob:.1%}")
-        lines.append("")
-
-    if extra_markets:
-        lines.append("Other markets (model view):")
-        if "btts" in extra_markets:
-            lines.append(f"  Both teams to score: yes {extra_markets['btts']['yes']:.1%} / no {extra_markets['btts']['no']:.1%}")
-        if "over_under_2.5" in extra_markets:
-            ou = extra_markets["over_under_2.5"]
-            lines.append(f"  Over/under 2.5 goals: over {ou['over']:.1%} / under {ou['under']:.1%}")
-        lines.append("")
-
-    best_gap_row = comparison.iloc[0]
-    if best_gap_row["gap"] > 0.03:
-        lines.append(
-            f"Bottom line: the model's strongest disagreement with the market is on "
-            f"{label[best_gap_row['outcome']]} ({best_gap_row['gap']:+.1%}) - "
-            f"{confidence_label(best_gap_row['gap'])}."
-        )
-    else:
-        lines.append("Bottom line: no strong disagreements here - the market's pricing looks efficient for this match.")
-
-    return "\n".join(lines)
+def _season_code(season_start_year: int) -> str:
+    """2025 -> '2526' (season 2025/26), matching football-data.co.uk's URL format."""
+    yy1 = season_start_year % 100
+    yy2 = (season_start_year + 1) % 100
+    return f"{yy1:02d}{yy2:02d}"
 
 
-# --- Odds movement tracking (works even with periodic, non-live polling) ---
-
-def log_odds_snapshot(home_team: str, away_team: str, bookmaker_odds: dict[str, float],
-                       log_path: str = "data/odds_history.csv") -> None:
-    """Appends a timestamped odds snapshot. Run this each time you check a
-    match and you build up a movement history even without a live feed."""
-    row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "home_team": home_team,
-        "away_team": away_team,
-        "home_odds": bookmaker_odds.get("home_win"),
-        "draw_odds": bookmaker_odds.get("draw"),
-        "away_odds": bookmaker_odds.get("away_win"),
-    }
-    file_exists = os.path.exists(log_path)
-    df = pd.DataFrame([row])
-    df.to_csv(log_path, mode="a", header=not file_exists, index=False)
+def _pick_odds_columns(df: pd.DataFrame) -> tuple[str, str, str] | None:
+    for h, d, a in ODDS_COLUMN_SETS:
+        if h in df.columns and d in df.columns and a in df.columns:
+            return h, d, a
+    return None
 
 
-def odds_movement(home_team: str, away_team: str,
-                   log_path: str = "data/odds_history.csv") -> dict | None:
-    """Compares the current snapshot against the earliest one logged for
-    this match, to show which way the market has moved (a 'steam move'
-    toward a team usually means informed money is backing them)."""
-    if not os.path.exists(log_path):
-        return None
-    df = pd.read_csv(log_path)
-    match_history = df[(df["home_team"] == home_team) & (df["away_team"] == away_team)]
-    if len(match_history) < 2:
-        return None
+def fetch_results(league_code: str, season_start_year: int) -> pd.DataFrame:
+    """
+    Downloads full-time results (+ odds if available) for one league/season.
+    Returns columns: date, home_team, away_team, home_goals, away_goals,
+    plus home_odds/draw_odds/away_odds if an odds column set was found.
 
-    match_history = match_history.sort_values("timestamp")
-    first, last = match_history.iloc[0], match_history.iloc[-1]
+    Example: fetch_results('E0', 2024) -> Premier League 2024/25 season.
+    """
+    url = f"{BASE_URL}/mmz4281/{_season_code(season_start_year)}/{league_code}.csv"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.text))
 
-    return {
-        "snapshots_logged": len(match_history),
-        "first_seen": first["timestamp"],
-        "last_seen": last["timestamp"],
-        "home_odds_change": round(last["home_odds"] - first["home_odds"], 3),
-        "draw_odds_change": round(last["draw_odds"] - first["draw_odds"], 3),
-        "away_odds_change": round(last["away_odds"] - first["away_odds"], 3),
-    }
+    out = pd.DataFrame({
+        "date": _parse_dates(df["Date"]),
+        "home_team": df["HomeTeam"],
+        "away_team": df["AwayTeam"],
+        "home_goals": df["FTHG"],
+        "away_goals": df["FTAG"],
+    })
+
+    odds_cols = _pick_odds_columns(df)
+    if odds_cols:
+        h, d, a = odds_cols
+        out["home_odds"] = df[h]
+        out["draw_odds"] = df[d]
+        out["away_odds"] = df[a]
+
+    return out.dropna(subset=["home_goals", "away_goals"]).reset_index(drop=True)
 
 
-def describe_movement(movement: dict, home_team: str, away_team: str) -> str:
-    """Plain-language read of odds movement. Shortening odds (going down)
-    means the market is growing more confident in that outcome."""
-    if movement is None:
-        return "No odds history yet for this match - movement analysis needs at least two snapshots over time."
+def fetch_multi_season_results(league_code: str, start_years: list[int]) -> pd.DataFrame:
+    """Convenience wrapper to pull several seasons and concatenate them -
+    gives the model more history to fit on. E.g. start_years=[2022,2023,2024]."""
+    frames = []
+    for year in start_years:
+        try:
+            frames.append(fetch_results(league_code, year))
+        except Exception as e:
+            print(f"Could not fetch {league_code} season {year}: {e}")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    def direction(change: float, label: str) -> str:
-        if abs(change) < 0.02:
-            return f"{label} odds barely moved ({change:+.2f})"
-        elif change < 0:
-            return f"{label} odds shortened ({change:+.2f}) - market growing more confident"
-        else:
-            return f"{label} odds drifted out ({change:+.2f}) - market growing less confident"
 
-    lines = [
-        f"Tracked across {movement['snapshots_logged']} snapshots, "
-        f"{movement['first_seen']} to {movement['last_seen']}:",
-        f"  {direction(movement['home_odds_change'], home_team)}",
-        f"  {direction(movement['draw_odds_change'], 'Draw')}",
-        f"  {direction(movement['away_odds_change'], away_team)}",
-    ]
-    return "\n".join(lines)
+def fetch_upcoming_fixtures(league_code: str | None = None) -> pd.DataFrame:
+    """
+    Downloads the current week's upcoming fixtures with pre-match odds
+    across all main leagues. Pass league_code to filter to one league
+    (e.g. 'E0'), or None to get everything.
+
+    Odds here are a snapshot collected Friday afternoons (weekend
+    fixtures) or Tuesday afternoons (midweek fixtures) - not live, but
+    free and good enough for pre-match value comparison.
+    """
+    url = f"{BASE_URL}/fixtures.csv"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.text))
+
+    if league_code:
+        df = df[df["Div"] == league_code]
+
+    out = pd.DataFrame({
+        "date": _parse_dates(df["Date"]),
+        "league": df["Div"],
+        "home_team": df["HomeTeam"],
+        "away_team": df["AwayTeam"],
+    })
+
+    odds_cols = _pick_odds_columns(df)
+    if odds_cols:
+        h, d, a = odds_cols
+        out["home_odds"] = df[h]
+        out["draw_odds"] = df[d]
+        out["away_odds"] = df[a]
+
+    return out.reset_index(drop=True)
+
+
+if __name__ == "__main__":
+    print("No API key needed. Example usage:")
+    print("  results = fetch_results('E0', 2024)              # one season")
+    print("  history = fetch_multi_season_results('E0', [2022, 2023, 2024])")
+    print("  fixtures = fetch_upcoming_fixtures('E0')          # this week's fixtures + odds")

@@ -1,149 +1,162 @@
 """
-Alternative to fetch_live_data.py that needs NO API key and NO signup:
-football-data.co.uk publishes free CSV downloads of historical results,
-match odds, and upcoming fixtures with pre-match odds, updated twice
-weekly (results) and Friday/Tuesday afternoons (fixtures).
+Dixon-Coles model for predicting football match scorelines.
 
-Trade-off vs the API-Football/Odds-API route: this only covers ~30
-countries' top divisions (not 1200+ leagues), and "upcoming odds" means
-a snapshot collected once before each round rather than truly live odds
-that update by the minute. For most personal-use score prediction this
-is a perfectly good trade for not needing any account at all.
+This is the standard statistical approach used widely in football
+analytics: each team gets an attack strength and a defense strength,
+fitted from historical goals data via maximum likelihood. Combined with
+a home-advantage term and a low-score correlation correction (the "Dixon-
+Coles adjustment"), it produces a full probability matrix over scorelines
+for any upcoming match.
 
-League codes (used in both functions below):
-    E0 = England Premier League      E1 = England Championship
-    SP1 = Spain La Liga               SP2 = Spain Segunda
-    D1 = Germany Bundesliga           D2 = Germany Bundesliga 2
-    I1 = Italy Serie A                I2 = Italy Serie B
-    F1 = France Ligue 1               F2 = France Ligue 2
-    N1 = Netherlands Eredivisie       B1 = Belgium First Division
-    P1 = Portugal Primeira Liga       T1 = Turkey Super Lig
-    G1 = Greece Super League
-Full list and column meanings: https://www.football-data.co.uk/notes.txt
+Usage:
+    model = DixonColes()
+    model.fit(matches_df)
+    matrix = model.predict_score_matrix("Arsenal", "Chelsea")
+    outcome_probs = model.predict_outcome_probs("Arsenal", "Chelsea")
 """
 from __future__ import annotations
-import requests
+
+import numpy as np
 import pandas as pd
-from io import StringIO
-
-BASE_URL = "https://www.football-data.co.uk"
-
-# Priority order for odds columns - not every season/league has every
-# bookmaker, so fall back down this list until one is found.
-ODDS_COLUMN_SETS = [
-    ("PSH", "PSD", "PSA"),      # Pinnacle - sharpest line, when available
-    ("B365H", "B365D", "B365A"),  # Bet365 - most consistently available
-    ("AvgH", "AvgD", "AvgA"),    # market average across bookmakers
-    ("WHH", "WHD", "WHA"),      # William Hill
-]
+from scipy.optimize import minimize
+from scipy.stats import poisson
 
 
-def _parse_dates(date_series: pd.Series) -> pd.Series:
-    """football-data.co.uk uses dd/mm/yy in recent seasons and dd/mm/yyyy
-    in some older ones - try both explicitly rather than let pandas guess
-    per-row (slow and warns)."""
-    parsed = pd.to_datetime(date_series, format="%d/%m/%y", errors="coerce")
-    still_missing = parsed.isna()
-    if still_missing.any():
-        parsed_alt = pd.to_datetime(date_series[still_missing], format="%d/%m/%Y", errors="coerce")
-        parsed.loc[still_missing] = parsed_alt
-    return parsed.dt.strftime("%Y-%m-%d")
+def _dc_adjustment(home_goals, away_goals, lam_home, lam_away, rho):
+    """Correction factor for low-scoring games (0-0, 1-0, 0-1, 1-1),
+    where goals aren't quite independent Poisson processes."""
+    if home_goals == 0 and away_goals == 0:
+        return 1 - lam_home * lam_away * rho
+    elif home_goals == 0 and away_goals == 1:
+        return 1 + lam_home * rho
+    elif home_goals == 1 and away_goals == 0:
+        return 1 + lam_away * rho
+    elif home_goals == 1 and away_goals == 1:
+        return 1 - rho
+    return 1.0
 
 
-def _season_code(season_start_year: int) -> str:
-    """2025 -> '2526' (season 2025/26), matching football-data.co.uk's URL format."""
-    yy1 = season_start_year % 100
-    yy2 = (season_start_year + 1) % 100
-    return f"{yy1:02d}{yy2:02d}"
+class DixonColes:
+    def __init__(self, xi: float = 0.0018):
+        """
+        xi: time-decay rate. Higher values weight recent matches more
+        heavily when fitting. 0 = no decay (all matches weighted equally).
+        """
+        self.xi = xi
+        self.teams: list[str] = []
+        self.attack: dict[str, float] = {}
+        self.defense: dict[str, float] = {}
+        self.home_adv: float = 0.0
+        self.rho: float = 0.0
+        self._fitted = False
 
+    def fit(self, matches: pd.DataFrame, date_col: str = "date"):
+        """
+        matches must have columns: home_team, away_team, home_goals, away_goals.
+        date_col is optional but enables time-weighting recent form more heavily.
+        """
+        self.teams = sorted(set(matches["home_team"]) | set(matches["away_team"]))
+        n = len(self.teams)
+        idx = {t: i for i, t in enumerate(self.teams)}
 
-def _pick_odds_columns(df: pd.DataFrame) -> tuple[str, str, str] | None:
-    for h, d, a in ODDS_COLUMN_SETS:
-        if h in df.columns and d in df.columns and a in df.columns:
-            return h, d, a
-    return None
+        if date_col in matches.columns:
+            dates = pd.to_datetime(matches[date_col])
+            days_ago = (dates.max() - dates).dt.days.values
+            weights = np.exp(-self.xi * days_ago)
+        else:
+            weights = np.ones(len(matches))
 
+        home_idx = matches["home_team"].map(idx).values
+        away_idx = matches["away_team"].map(idx).values
+        home_goals = matches["home_goals"].values
+        away_goals = matches["away_goals"].values
 
-def fetch_results(league_code: str, season_start_year: int) -> pd.DataFrame:
-    """
-    Downloads full-time results (+ odds if available) for one league/season.
-    Returns columns: date, home_team, away_team, home_goals, away_goals,
-    plus home_odds/draw_odds/away_odds if an odds column set was found.
+        def unpack(params):
+            attack = params[:n]
+            defense = params[n:2 * n]
+            home_adv = params[2 * n]
+            rho = params[2 * n + 1]
+            return attack, defense, home_adv, rho
 
-    Example: fetch_results('E0', 2024) -> Premier League 2024/25 season.
-    """
-    url = f"{BASE_URL}/mmz4281/{_season_code(season_start_year)}/{league_code}.csv"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text))
+        def neg_log_likelihood(params):
+            attack, defense, home_adv, rho = unpack(params)
+            lam_home = np.exp(attack[home_idx] - defense[away_idx] + home_adv)
+            lam_away = np.exp(attack[away_idx] - defense[home_idx])
 
-    out = pd.DataFrame({
-        "date": _parse_dates(df["Date"]),
-        "home_team": df["HomeTeam"],
-        "away_team": df["AwayTeam"],
-        "home_goals": df["FTHG"],
-        "away_goals": df["FTAG"],
-    })
+            ll = (
+                poisson.logpmf(home_goals, lam_home)
+                + poisson.logpmf(away_goals, lam_away)
+            )
+            # low-score correlation adjustment, applied multiplicatively
+            adj = np.array([
+                _dc_adjustment(hg, ag, lh, la, rho)
+                for hg, ag, lh, la in zip(home_goals, away_goals, lam_home, lam_away)
+            ])
+            adj = np.clip(adj, 1e-6, None)  # avoid log(negative/0)
+            ll = ll + np.log(adj)
+            return -np.sum(ll * weights)
 
-    odds_cols = _pick_odds_columns(df)
-    if odds_cols:
-        h, d, a = odds_cols
-        out["home_odds"] = df[h]
-        out["draw_odds"] = df[d]
-        out["away_odds"] = df[a]
+        x0 = np.concatenate([np.zeros(n), np.zeros(n), [0.2], [0.0]])
+        # constrain average attack strength to 0 for identifiability
+        constraints = [{
+            "type": "eq",
+            "fun": lambda p: np.mean(p[:n]),
+        }]
+        result = minimize(
+            neg_log_likelihood, x0, method="SLSQP", constraints=constraints,
+            options={"maxiter": 200, "ftol": 1e-8},
+        )
+        attack, defense, home_adv, rho = unpack(result.x)
 
-    return out.dropna(subset=["home_goals", "away_goals"]).reset_index(drop=True)
+        self.attack = dict(zip(self.teams, attack))
+        self.defense = dict(zip(self.teams, defense))
+        self.home_adv = float(home_adv)
+        self.rho = float(np.clip(rho, -0.3, 0.3))
+        self._fitted = True
+        return self
 
+    def _expected_goals(self, home_team: str, away_team: str) -> tuple[float, float]:
+        if not self._fitted:
+            raise RuntimeError("Call .fit() before predicting.")
+        for t in (home_team, away_team):
+            if t not in self.attack:
+                raise ValueError(f"Unknown team: {t}")
+        lam_home = np.exp(self.attack[home_team] - self.defense[away_team] + self.home_adv)
+        lam_away = np.exp(self.attack[away_team] - self.defense[home_team])
+        return float(lam_home), float(lam_away)
 
-def fetch_multi_season_results(league_code: str, start_years: list[int]) -> pd.DataFrame:
-    """Convenience wrapper to pull several seasons and concatenate them -
-    gives the model more history to fit on. E.g. start_years=[2022,2023,2024]."""
-    frames = []
-    for year in start_years:
-        try:
-            frames.append(fetch_results(league_code, year))
-        except Exception as e:
-            print(f"Could not fetch {league_code} season {year}: {e}")
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    def predict_score_matrix(self, home_team: str, away_team: str, max_goals: int = 8) -> pd.DataFrame:
+        """Returns a (max_goals+1) x (max_goals+1) DataFrame of scoreline probabilities."""
+        lam_home, lam_away = self._expected_goals(home_team, away_team)
+        home_range = np.arange(max_goals + 1)
+        away_range = np.arange(max_goals + 1)
+        matrix = np.outer(
+            poisson.pmf(home_range, lam_home),
+            poisson.pmf(away_range, lam_away),
+        )
+        for h in range(2):
+            for a in range(2):
+                matrix[h, a] *= _dc_adjustment(h, a, lam_home, lam_away, self.rho)
+        matrix = matrix / matrix.sum()  # renormalize after adjustment
+        return pd.DataFrame(matrix, index=home_range, columns=away_range)
 
+    def predict_outcome_probs(self, home_team: str, away_team: str, max_goals: int = 8) -> dict[str, float]:
+        """Returns {'home_win':, 'draw':, 'away_win':} probabilities."""
+        matrix = self.predict_score_matrix(home_team, away_team, max_goals).values
+        home_win = np.tril(matrix, -1).sum()
+        draw = np.trace(matrix)
+        away_win = np.triu(matrix, 1).sum()
+        return {"home_win": float(home_win), "draw": float(draw), "away_win": float(away_win)}
 
-def fetch_upcoming_fixtures(league_code: str | None = None) -> pd.DataFrame:
-    """
-    Downloads the current week's upcoming fixtures with pre-match odds
-    across all main leagues. Pass league_code to filter to one league
-    (e.g. 'E0'), or None to get everything.
+    def most_likely_scores(self, home_team: str, away_team: str, top_n: int = 5, max_goals: int = 8):
+        matrix = self.predict_score_matrix(home_team, away_team, max_goals)
+        flat = matrix.stack().sort_values(ascending=False).head(top_n)
+        return [(f"{h}-{a}", float(p)) for (h, a), p in flat.items()]
 
-    Odds here are a snapshot collected Friday afternoons (weekend
-    fixtures) or Tuesday afternoons (midweek fixtures) - not live, but
-    free and good enough for pre-match value comparison.
-    """
-    url = f"{BASE_URL}/fixtures.csv"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text))
-
-    if league_code:
-        df = df[df["Div"] == league_code]
-
-    out = pd.DataFrame({
-        "date": _parse_dates(df["Date"]),
-        "league": df["Div"],
-        "home_team": df["HomeTeam"],
-        "away_team": df["AwayTeam"],
-    })
-
-    odds_cols = _pick_odds_columns(df)
-    if odds_cols:
-        h, d, a = odds_cols
-        out["home_odds"] = df[h]
-        out["draw_odds"] = df[d]
-        out["away_odds"] = df[a]
-
-    return out.reset_index(drop=True)
-
-
-if __name__ == "__main__":
-    print("No API key needed. Example usage:")
-    print("  results = fetch_results('E0', 2024)              # one season")
-    print("  history = fetch_multi_season_results('E0', [2022, 2023, 2024])")
-    print("  fixtures = fetch_upcoming_fixtures('E0')          # this week's fixtures + odds")
+    def team_ratings(self) -> pd.DataFrame:
+        """Attack/defense strength table, useful for a dashboard leaderboard."""
+        return pd.DataFrame({
+            "team": self.teams,
+            "attack": [self.attack[t] for t in self.teams],
+            "defense": [self.defense[t] for t in self.teams],
+        }).sort_values("attack", ascending=False).reset_index(drop=True)

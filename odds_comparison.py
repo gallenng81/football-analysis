@@ -1,70 +1,81 @@
 """
-Compares model-derived probabilities against bookmaker market prices, for
-informational and educational purposes. This module does not place bets,
-recommend wagers, or link to any bookmaker - it simply shows where a
-statistical model's view of a match differs from the market's, which is
-useful for understanding how odds are formed and how model-based
-forecasts compare to market consensus.
+Estimates how a key player's absence (injury, suspension) might shift a
+team's attack/defense strength for prediction purposes.
+
+This project has no player-level statistical data (only team-level goals
+history), so this is a transparent heuristic: the user specifies which
+player is missing and how important that player is to the team (as a
+percentage of team output), and this scales the team's attack or defense
+rating down accordingly before generating a match prediction. It is not a
+learned model - it is a clearly-labeled adjustment tool, since real
+injury-impact modeling would require player-level data this project
+doesn't have.
+
+For real injury data feeds, API-Football's /injuries endpoint (see
+fetch_live_data.py) can supply who's out; this module still needs an
+importance estimate per player, since "who is injured" and "how much
+does losing them hurt" are different problems.
 """
 from __future__ import annotations
+from dixon_coles import DixonColes
 
 
-def implied_probability(decimal_odds: float) -> float:
-    """Converts decimal odds (e.g. 2.50) to implied probability (0.40)."""
-    return 1 / decimal_odds
-
-
-def devig_market_probabilities(implied_probs: dict[str, float]) -> dict[str, float]:
+def adjusted_team_strength(model: DixonColes, team: str, missing_player_impact_pct: float) -> dict:
     """
-    Bookmaker odds always overround (sum of implied probabilities exceeds
-    100%) - that excess is the bookmaker's built-in margin. This rescales
-    so probabilities sum to 1, giving a fairer, margin-free market
-    estimate to compare against the model.
+    missing_player_impact_pct: the missing player's estimated share of the
+    team's attacking output, as a percentage (e.g. 25 for a striker who
+    scores/creates roughly a quarter of the team's goal threat). This
+    reduces the team's attack rating proportionally.
+
+    This is a simple linear heuristic, not a fitted statistical
+    relationship - treat the resulting prediction shift as illustrative,
+    not precise.
     """
-    total = sum(implied_probs.values())
-    return {k: v / total for k, v in implied_probs.items()}
+    if team not in model.attack:
+        raise ValueError(f"Unknown team: {team}")
+
+    original_attack = model.attack[team]
+    impact_fraction = missing_player_impact_pct / 100
+    adjusted_attack = original_attack - impact_fraction * abs(original_attack) if original_attack != 0 else original_attack * (1 - impact_fraction)
+
+    return {
+        "team": team,
+        "original_attack_rating": round(original_attack, 3),
+        "adjusted_attack_rating": round(adjusted_attack, 3),
+        "impact_applied_pct": missing_player_impact_pct,
+    }
 
 
-def find_probability_divergences(model_probs: dict[str, float], market_odds: dict[str, float],
-                                  divergence_threshold: float = 0.03) -> list[dict]:
+def predict_with_injury_adjustment(model: DixonColes, home_team: str, away_team: str,
+                                    home_missing_impact_pct: float = 0,
+                                    away_missing_impact_pct: float = 0,
+                                    max_goals: int = 6) -> dict:
     """
-    Identifies outcomes where the model's probability estimate differs
-    meaningfully from the market's margin-free implied probability.
-    This is presented purely as a statistical comparison - it is not a
-    betting recommendation.
-
-    model_probs: e.g. {'home_win': 0.45, 'draw': 0.25, 'away_win': 0.30}
-    market_odds: decimal odds for the same keys, e.g. {'home_win': 2.10, 'draw': 3.40, 'away_win': 3.80}
-    divergence_threshold: minimum (model_prob - market_fair_prob) to report
-
-    Returns a list of divergences, sorted by size (largest first).
+    Temporarily adjusts attack ratings for missing-player impact, predicts
+    the match, then restores the original ratings. Returns both the
+    baseline (unadjusted) and adjusted outcome probabilities so the user
+    can see the size of the shift.
     """
-    raw_implied = {k: implied_probability(v) for k, v in market_odds.items()}
-    fair_implied = devig_market_probabilities(raw_implied)
+    baseline = model.predict_outcome_probs(home_team, away_team, max_goals)
 
-    divergences = []
-    for outcome, model_p in model_probs.items():
-        fair_p = fair_implied[outcome]
-        divergence = model_p - fair_p
-        if divergence >= divergence_threshold:
-            divergences.append({
-                "outcome": outcome,
-                "model_probability": round(model_p, 4),
-                "market_odds": market_odds[outcome],
-                "market_fair_probability": round(fair_p, 4),
-                "divergence": round(divergence, 4),
-                "model_implied_odds": round(1 / model_p, 2) if model_p > 0 else None,
-            })
-    return sorted(divergences, key=lambda x: x["divergence"], reverse=True)
+    original_home_attack = model.attack[home_team]
+    original_away_attack = model.attack[away_team]
 
+    try:
+        if home_missing_impact_pct:
+            model.attack[home_team] = adjusted_team_strength(
+                model, home_team, home_missing_impact_pct)["adjusted_attack_rating"]
+        if away_missing_impact_pct:
+            model.attack[away_team] = adjusted_team_strength(
+                model, away_team, away_missing_impact_pct)["adjusted_attack_rating"]
 
-if __name__ == "__main__":
-    # Example: the model's view differs from the market's on the home side
-    model_probs = {"home_win": 0.45, "draw": 0.25, "away_win": 0.30}
-    market_odds = {"home_win": 2.50, "draw": 3.40, "away_win": 3.20}
+        adjusted = model.predict_outcome_probs(home_team, away_team, max_goals)
+    finally:
+        model.attack[home_team] = original_home_attack
+        model.attack[away_team] = original_away_attack
 
-    divergences = find_probability_divergences(model_probs, market_odds)
-    for d in divergences:
-        print(f"{d['outcome']}: model {d['model_probability']:.1%} vs "
-              f"market {d['market_fair_probability']:.1%} "
-              f"(divergence {d['divergence']:+.1%}, market odds {d['market_odds']})")
+    return {
+        "baseline": baseline,
+        "adjusted": adjusted,
+        "shift": {k: round(adjusted[k] - baseline[k], 4) for k in baseline},
+    }
